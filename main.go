@@ -6,13 +6,45 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sort"
+	"strings"
 	"sync"
 )
 
 type Metric struct {
-	Metric    string  `json:"metric"`
-	Timestamp int64   `json:"timestamp"`
-	Value     float64 `json:"value"`
+	Metric    string            `json:"metric"`
+	Tags      map[string]string `json:"tags,omitempty"`
+	Timestamp int64             `json:"timestamp"`
+	Value     float64           `json:"value"`
+}
+
+// seriesKey canonicalizes a metric name + tag set into one string so that
+// {host=a,region=b} and {region=b,host=a} map to the same series regardless
+// of the order tags arrived in the JSON body.
+func seriesKey(m Metric) string {
+	if len(m.Tags) == 0 {
+		return m.Metric
+	}
+
+	keys := make([]string, 0, len(m.Tags))
+	for k := range m.Tags {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	var b strings.Builder
+	b.WriteString(m.Metric)
+	b.WriteByte('{')
+	for i, k := range keys {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(k)
+		b.WriteByte('=')
+		b.WriteString(m.Tags[k])
+	}
+	b.WriteByte('}')
+	return b.String()
 }
 
 var metrics = make(map[string][]Metric)
@@ -64,8 +96,9 @@ func ingestHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 3. Update RAM
-	metrics[metric.Metric] = append(
-		metrics[metric.Metric],
+	key := seriesKey(metric)
+	metrics[key] = append(
+		metrics[key],
 		metric,
 	)
 
@@ -115,8 +148,9 @@ func replayWAL() error {
 			return err
 		}
 
-		metrics[metric.Metric] = append(
-			metrics[metric.Metric],
+		key := seriesKey(metric)
+		metrics[key] = append(
+			metrics[key],
 			metric,
 		)
 	}
