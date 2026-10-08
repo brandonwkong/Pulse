@@ -4,9 +4,11 @@ import (
 	"bufio"
 	"encoding/json"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -128,6 +130,96 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// queryHandler answers GET /query?metric=X&from=&to=&<tag>=<value>.
+// from/to are inclusive Unix timestamps; any query param other than
+// metric/from/to is treated as an exact-match tag filter. Unspecified
+// tags on a series are ignored, so "metric=cpu&host=a" matches every
+// cpu series tagged host=a regardless of what other tags it carries.
+func queryHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	q := r.URL.Query()
+
+	metricName := q.Get("metric")
+	if metricName == "" {
+		http.Error(w, "metric is required", http.StatusBadRequest)
+		return
+	}
+
+	from := int64(math.MinInt64)
+	if v := q.Get("from"); v != "" {
+		parsed, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			http.Error(w, "invalid from", http.StatusBadRequest)
+			return
+		}
+		from = parsed
+	}
+
+	to := int64(math.MaxInt64)
+	if v := q.Get("to"); v != "" {
+		parsed, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			http.Error(w, "invalid to", http.StatusBadRequest)
+			return
+		}
+		to = parsed
+	}
+
+	tagFilters := make(map[string]string)
+	for k, v := range q {
+		if k == "metric" || k == "from" || k == "to" {
+			continue
+		}
+		tagFilters[k] = v[0]
+	}
+
+	mu.RLock()
+	defer mu.RUnlock()
+
+	result := make(map[string][]Metric)
+	for key, points := range metrics {
+		if len(points) == 0 || points[0].Metric != metricName {
+			continue
+		}
+		if !matchesTags(points[0].Tags, tagFilters) {
+			continue
+		}
+
+		// Points within a series are appended in arrival order, which we
+		// rely on being timestamp order (see M1's open item: nothing
+		// currently enforces that). Binary search assumes it holds.
+		lo := sort.Search(len(points), func(i int) bool {
+			return points[i].Timestamp >= from
+		})
+		hi := sort.Search(len(points), func(i int) bool {
+			return points[i].Timestamp > to
+		})
+
+		if lo < hi {
+			result[key] = points[lo:hi]
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(result); err != nil {
+		http.Error(w, "failed to encode query result", http.StatusInternalServerError)
+		return
+	}
+}
+
+func matchesTags(tags, filters map[string]string) bool {
+	for k, v := range filters {
+		if tags[k] != v {
+			return false
+		}
+	}
+	return true
+}
+
 func replayWAL() error {
 	file, err := os.Open("metrics.log")
 	if err != nil {
@@ -182,6 +274,7 @@ func main() {
 	http.HandleFunc("/health", healthHandler)
 	http.HandleFunc("/ingest", ingestHandler)
 	http.HandleFunc("/metrics", metricsHandler)
+	http.HandleFunc("/query", queryHandler)
 
 	// 4. Start server
 	log.Println("Pulse running on :8080")
